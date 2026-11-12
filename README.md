@@ -90,7 +90,7 @@ The project is currently under development. Features and gameplay mechanics are 
 
 ## Developers
 
-Christian Dane R. Naz - BS Computer Science
-Josh Warren S. Quinto - BS Information Technology
-Raphael Julius Q. Sibulo - BS Computer Science
-Aj M. Villafuerte - BS Computer Science
+1. Christian Dane R. Naz - BS Computer Science
+2. Josh Warren S. Quinto - BS Information Technology
+3. Raphael Julius Q. Sibulo - BS Computer Science
+4. Aj M. Villafuerte - BS Computer Science
