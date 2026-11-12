@@ -4,9 +4,6 @@
 /*
  * KINGS AND CANNONS - TWO-PLAYER TCP CLIENT
  *
- * Uses only client.c and server.c.
- * No custom .h files needed.
- *
  * Controls:
  *   Mouse     - Select tools and board squares
  *   E / Enter - End turn
@@ -531,18 +528,6 @@ static void calculate_layout(void) {
 
     int width = layout.width;
     int height = layout.height;
-
-    /*
-     * The original full-size board uses:
-     *
-     * - 7-character-wide cells
-     * - 3-line-high cells
-     * - Dark +---+ borders
-     * - Pastel red/green backgrounds
-     *
-     * Smaller terminal windows show a
-     * scrollable viewport of the same board.
-     */
 
     layout.cell_width = 7;
     layout.cell_height = 3;
