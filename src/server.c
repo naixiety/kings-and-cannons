@@ -25,6 +25,21 @@
 #define CANNONS_PER_TURN 2
 #define UNDO_LIMIT 128
 
+/* Print Game events. */
+static void log_square(int player, const char *action, int row, int col) {
+    printf("[PLAYER %d] %s at %c%d\n", player + 1,
+           action, 'A' + col, row + 1);
+    fflush(stdout);
+}
+
+static void log_result(int result) {
+    puts("\n============= GAME OVER =============");
+    if (result == 2) puts("[SERVER] Match ended in a DRAW.");
+    else if (result >= 0) printf("[SERVER] Player %d WINS!\n", result + 1);
+    fflush(stdout);
+}
+
+
 /* GAME STRUCTURES */
 
 typedef struct {
@@ -142,6 +157,12 @@ static int round_number = 1;
 
 static int winner = -1;
 
+/*
+ * phase:
+ * 0 = King placement
+ * 1 = Normal gameplay
+ * 2 = Game finished
+ */
 static int phase = 0;
 
 static Tool selected_tool = TOOL_NONE;
@@ -154,7 +175,7 @@ static double deadline = 0;
 
 static char message[180] = "";
 static char notice[180] = "Waiting for players.";
-static int visual_stage = 0; 
+static int visual_stage = 0; /* Attack animation stage */
 
 /* HELPERS */
 
@@ -241,6 +262,8 @@ static void undo_action(void) {
 
     game = undo_stack[--undo_count];
     selected_tool = TOOL_NONE;
+    printf("[PLAYER %d] Undid the last action.\n", active_player + 1);
+    fflush(stdout);
 
     snprintf(
         message,
@@ -319,7 +342,7 @@ static int move_legal(
         return 0;
     }
 
-    /* Knight-style (LEAP MOVEMENT) */
+    /* Knight-style LEAP can jump over pieces. */
     if (type != LEAP) {
         int row_step = direction(dest_row - from.row);
         int col_step = direction(dest_col - from.col);
@@ -354,7 +377,7 @@ static int move_legal(
     return 1;
 }
 
-/* DECLERATION */
+/* WINNER */
 
 static void update_victory(void) {
     if (game.lives[0] <= 0 && game.lives[1] <= 0) {
@@ -457,6 +480,7 @@ static void perform_board_action(
         game.king[player] = (Position){row, col};
 
         game.board[row][col] = (Cell){KING, player};
+        log_square(player, "Placed KING", row, col);
 
         snprintf(
             message,
@@ -480,6 +504,7 @@ static void perform_board_action(
 
         game.nuke_target[player] = (Position){row, col};
         game.nuke_used[player] = 1;
+        log_square(player, "Aimed NUKE", row, col);
 
         selected_tool = TOOL_NONE;
 
@@ -526,6 +551,10 @@ static void perform_board_action(
 
         game.king[player] = (Position){row, col};
         game.king_moved[player] = 1;
+        printf("[PLAYER %d] Moved KING from %c%d to %c%d\n",
+               player + 1, 'A' + old.col, old.row + 1,
+               'A' + col, row + 1);
+        fflush(stdout);
 
         if (selected_move != STEP) {
             game.moves_remaining[player][selected_move]--;
@@ -581,8 +610,10 @@ static void perform_board_action(
 
     if (selected_tool == TOOL_SHIELD) {
         game.shields_placed[player]++;
+        log_square(player, "Placed SHIELD", row, col);
     } else {
         game.cannon_placements[player]++;
+        log_square(player, "Placed CANNON", row, col);
     }
 
     if (selected_tool == TOOL_CANNON &&
@@ -752,7 +783,7 @@ static void send_view(
                     packet.impacts[packet.impact_count++] = square;
             }
         } else {
-  
+
             for (int i = 0; i < bullet_count && i < 4; i++) {
                 int square = bullets[i] % 100;
                 if (square >= 0 && square < 100)
@@ -826,6 +857,11 @@ static void visual_frame(
 
 static void begin_turn(void) {
     deadline = seconds_now() + TURN_SECONDS;
+    if (phase == 1) {
+        printf("\n[SERVER] Round %d: Player %d's turn.\n",
+               round_number, current + 1);
+        fflush(stdout);
+    }
     last_tick = -1;
 
     snprintf(
@@ -842,6 +878,12 @@ static void begin_turn(void) {
 }
 
 static void finish_game(void) {
+    if (phase != 2) {
+        log_result(winner);
+        printf("[SERVER] Final lives: P1=%d, P2=%d\n",
+               game.lives[0], game.lives[1]);
+        fflush(stdout);
+    }
     phase = 2;
     deadline = seconds_now();
     publish();
@@ -924,6 +966,8 @@ static void resolve_volley(void) {
     }
 
     if (blast_count > 0) {
+        puts("[SERVER] NUKE detonated!");
+        fflush(stdout);
         snprintf(
             notice,
             sizeof(notice),
@@ -994,6 +1038,8 @@ static void resolve_volley(void) {
 
             Cell target = game.board[row][col];
 
+            /* * Projectiles CAN PASS  */
+
             if (target.piece == EMPTY ||
                 target.piece == CANNON ||
                 (target.piece == KING &&
@@ -1015,6 +1061,10 @@ static void resolve_volley(void) {
                 row * BOARD_SIZE + col + target.owner * 100 + shot->owner * 200;
 
             if (target.piece == SHIELD) {
+                printf("[PLAYER %d] Cannon hit Player %d's SHIELD at %c%d\n",
+                       shot->owner + 1, target.owner + 1,
+                       'A' + col, row + 1);
+                fflush(stdout);
                 broken[row][col] = 1;
 
                 if (credit[row][col] < 0) {
@@ -1023,6 +1073,10 @@ static void resolve_volley(void) {
             }
 
             if (target.piece == KING) {
+                printf("[PLAYER %d] Cannon hit Player %d's KING at %c%d\n",
+                       shot->owner + 1, target.owner + 1,
+                       'A' + col, row + 1);
+                fflush(stdout);
                 king_hits[target.owner]++;
             }
         }
@@ -1097,6 +1151,9 @@ static void resolve_volley(void) {
     }
 
     update_victory();
+    printf("[SERVER] Lives after combat: Player 1=%d, Player 2=%d\n",
+           game.lives[0], game.lives[1]);
+    fflush(stdout);
     round_number++;
 
     snprintf(
@@ -1114,6 +1171,10 @@ static void resolve_volley(void) {
 /* NEXT TURN */
 
 static void next_turn(void) {
+    if (phase == 1) {
+        printf("[PLAYER %d] Ended turn.\n", current + 1);
+        fflush(stdout);
+    }
     undo_count = 0;
     selected_tool = TOOL_NONE;
 
@@ -1164,6 +1225,9 @@ static void fallback_king(void) {
     int col = 4;
 
     if (game.king[current].row < 0) {
+        printf("[SERVER] Player %d timed out; placing king automatically.\n",
+               current + 1);
+        fflush(stdout);
         game.king[current] = (Position){row, col};
         game.board[row][col] =
             (Cell){KING, current};
@@ -1177,6 +1241,8 @@ static void on_command(
     const Packet *command
 ) {
     if (command->action == ACT_QUIT) {
+        printf("[PLAYER %d] Quit the match.\n", player + 1);
+        fflush(stdout);
         winner = 1 - player;
         finish_game();
         return;
