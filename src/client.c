@@ -1,16 +1,6 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-/*
- * KINGS AND CANNONS - TWO-PLAYER TCP CLIENT
- *
- * Controls:
- *   Mouse     - Select tools and board squares
- *   E / Enter - End turn
- *   Arrows    - Scroll board
- *   Wheel     - Scroll board
- *   Q         - Quit
- */
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,8 +15,10 @@
 #include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
+#include <time.h>
+#include <netinet/tcp.h>
+#include "terminal_ui.h"
 
-/* ==================== SHARED GAME DEFINITIONS ==================== */
 
 #define BOARD_SIZE 10
 #define PLAYER_COUNT 2
@@ -138,6 +130,8 @@ typedef struct {
 #define YELLOW_BG "\033[48;5;228m\033[30m"
 #define BLACK_BG "\033[48;5;234m\033[97m"
 #define BULLET_BG "\033[48;5;208m\033[30m"
+#define LEGAL_BG "\033[48;5;159m\033[30m"
+#define CHARGE_BG "\033[48;5;214m\033[30m"
 
 #define BUTTON_BG "\033[48;5;238m\033[97m"
 #define SELECT_BG "\033[48;5;228m\033[30m"
@@ -183,6 +177,18 @@ static int running = 1;
 static int have_state = 0;
 
 static Packet latest;
+static struct timespec received_at;
+static int previous_timer = -1;
+
+static int seconds_left(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (now.tv_sec - received_at.tv_sec) +
+                     (now.tv_nsec - received_at.tv_nsec) / 1000000000.0;
+    int left = latest.seconds - (int)elapsed;
+    return left < 0 ? 0 : left;
+}
+
 
 static Tool selected_tool = TOOL_NONE;
 static MoveType selected_move = STEP;
@@ -220,6 +226,7 @@ static void restore_terminal(void) {
 
     fputs(
         "\033[?1000l"
+        "\033[?1049l"
         "\033[?1006l"
         "\033[?25h"
         "\033[0m",
@@ -286,6 +293,8 @@ static int initialize_terminal(void) {
     /* Enable terminal mouse reporting. */
 
     fputs(
+        "\033[?1049h"
+        "\033[2J\033[H"
         "\033[?1000h"
         "\033[?1006h"
         "\033[?25l",
@@ -674,6 +683,46 @@ static int has_impact(int square) {
     return 0;
 }
 
+/* Show movement of the king */
+static int legal_destination(int row, int col) {
+    if (!have_state || latest.kind == PKT_FRAME ||
+        latest.phase != 1 || latest.current != latest.player ||
+        selected_tool != TOOL_KING) return 0;
+    int p = latest.player;
+    Position k = latest.state.king[p];
+    if (k.row < 0 || k.col < 0 || latest.state.king_moved[p] ||
+        (p == 0 ? row >= 5 : row < 5) ||
+        latest.state.board[row][col].piece != EMPTY) return 0;
+    int dr = row - k.row, dc = col - k.col;
+    int a = dr < 0 ? -dr : dr;
+    int b = dc < 0 ? -dc : dc;
+    if (!a && !b) return 0;
+    if (selected_move != STEP &&
+        latest.state.moves_remaining[p][selected_move] <= 0) return 0;
+    int valid = 0;
+    switch (selected_move) {
+        case STEP:   valid = a + b == 1; break;
+        case SKEW:   valid = a == 2 && b == 2; break;
+        case LEAP:   valid = (a == 2 && b == 1) || (a == 1 && b == 2); break;
+        case AXIS:   valid = (a == 2 && !b) || (!a && b == 2); break;
+        case JASMIN: valid = a == b || !a || !b; break;
+        default: break;
+    }
+    if (!valid) return 0;
+    if (selected_move != LEAP) {
+        int sy = (dr > 0) - (dr < 0), sx = (dc > 0) - (dc < 0);
+        for (int y = k.row + sy, x = k.col + sx;
+             y != row || x != col; y += sy, x += sx) {
+            if (latest.state.board[y][x].piece != EMPTY) return 0;
+        }
+    }
+    return 1;
+}
+
+static int is_nuke_frame(void) {
+    return latest.kind == PKT_FRAME && latest.tool == TOOL_NUKE;
+}
+
 /* ==================== BOARD COLORS ==================== */
 
 static const char *square_color(
@@ -683,12 +732,14 @@ static const char *square_color(
     int square = row * BOARD_SIZE + col;
 
     if (has_impact(square)) {
-        return YELLOW_BG;
+        return is_nuke_frame() && latest.action == 1 ? CHARGE_BG : YELLOW_BG;
     }
 
     if (has_projectile(square)) {
         return BULLET_BG;
     }
+
+    if (legal_destination(row, col)) return LEGAL_BG;
 
     if (latest.state.crater[row][col] ||
         latest.state.breach[row][col]) {
@@ -711,19 +762,16 @@ static const char *square_label(
     int square = row * BOARD_SIZE + col;
 
     if (has_impact(square)) {
-        return "BOOM";
+        return is_nuke_frame() && latest.action == 1 ? "..." : "BOOM";
     }
 
     if (has_projectile(square)) {
-        return "!";
+        return latest.action == 2 ? "!" : "^";
     }
 
-    Cell cell = latest.state.board[row][col];
+    if (legal_destination(row, col)) return "*";
 
-    /*
-     * The server has already removed enemy
-     * pieces from this player's packet.
-     */
+    Cell cell = latest.state.board[row][col];
 
     if (cell.piece == KING) {
         return cell.owner == 0 ? "K1" : "K2";
@@ -949,6 +997,28 @@ static void draw_button(
     fputs(RESET, stdout);
 }
 
+/* clock */
+static void draw_side_clock(void) {
+    int x = layout.grid_x +
+        layout.cols_visible * (layout.cell_width + 1) + 3;
+    if (!have_state || x + 17 > layout.width || layout.grid_y + 5 > layout.height)
+        return;
+    int left = seconds_left();
+    cursor_at(layout.grid_y + 1, x);
+    printf("\033[1m TURN CLOCK \033[0m");
+    cursor_at(layout.grid_y + 2, x);
+    printf(left <= 10 ? "\033[1;31m  %02d seconds  \033[0m" :
+                       "  %02d seconds  ", left);
+    cursor_at(layout.grid_y + 3, x);
+    putchar('[');
+    int filled = left * 12 / 60;
+    for (int i = 0; i < 12; i++)
+        putchar(i < filled ? '=' : ' ');
+    putchar(']');
+    cursor_at(layout.grid_y + 5, x);
+    printf("ENTER: END TURN");
+}
+
 /* ==================== PLAYER TURN ==================== */
 
 static int can_play(void) {
@@ -957,15 +1027,52 @@ static int can_play(void) {
            latest.current == latest.player;
 }
 
-/* ==================== COMPLETE UI ==================== */
+/* ==================== VICTORY / DEFEAT ==================== */
+
+
+static void draw_end_screen(void) {
+    const char *word = latest.winner == latest.player
+        ? "VICTORY" : "DEFEAT";
+
+    /* Same simple ASCII border for both results. */
+    const char *border = "//===================================//";
+    const int inside_width = (int)strlen(border) - 4;
+    int screen_width, screen_height;
+    get_terminal_size(&screen_width, &screen_height);
+
+    int x = (screen_width - (int)strlen(border)) / 2 + 1;
+    int y = (screen_height - 5) / 2 + 1;
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+
+    fputs("\033[2J\033[H", stdout);
+    cursor_at(y, x);
+    printf("%s", border);
+    cursor_at(y + 1, x);
+    printf("||%*s||", inside_width, "");
+    cursor_at(y + 2, x);
+    int left = (inside_width - (int)strlen(word)) / 2;
+    int right = inside_width - left - (int)strlen(word);
+    printf("||%*s%s%*s||", left, "", word, right, "");
+    cursor_at(y + 3, x);
+    printf("||%*s||", inside_width, "");
+    cursor_at(y + 4, x);
+    printf("%s", border);
+    fflush(stdout);
+}
+
+/* ==================== UI ==================== */
 
 static void redraw(void) {
     calculate_layout();
 
-    fputs(
-        "\033[2J\033[H",
-        stdout
-    );
+    static int previous_width = -1, previous_height = -1;
+    if (previous_width != layout.width || previous_height != layout.height) {
+        fputs("\033[2J", stdout);
+        previous_width = layout.width;
+        previous_height = layout.height;
+    }
+    fputs("\033[?2026h\033[H", stdout);
 
     char text[256];
 
@@ -975,7 +1082,14 @@ static void redraw(void) {
             "KINGS AND CANNONS | CONNECTING..."
         );
 
+        fputs("\033[?2026l", stdout);
         fflush(stdout);
+        return;
+    }
+
+    if (latest.phase == 2) {
+        fputs("\033[?2026l", stdout);
+        draw_end_screen();
         return;
     }
 
@@ -997,9 +1111,16 @@ static void redraw(void) {
 
     write_line(1, text);
 
-    /* Turn status */
+    /* Attack animation banner or turn status. */
 
-    if (latest.phase == 2) {
+    if (latest.kind == PKT_FRAME && latest.tool == TOOL_NUKE) {
+        snprintf(text, sizeof text,
+                 latest.action == 1 ? "!!! NUKE CHARGING !!!" :
+                 latest.action == 2 ? "!!! NUCLEAR BOOM BOOM !!!" :
+                                      "!!! NUCLEAR AFTERSHOCK !!!");
+    } else if (latest.kind == PKT_FRAME && latest.tool == TOOL_CANNON) {
+        snprintf(text, sizeof text, "!!! CANNONS FIRING - BOOM !!!");
+    } else if (latest.phase == 2) {
         if (latest.winner == 2) {
             snprintf(
                 text,
@@ -1021,7 +1142,7 @@ static void redraw(void) {
             text,
             sizeof(text),
             "YOUR TURN | %02ds | E/Enter: END TURN | Q: QUIT",
-            latest.seconds
+            seconds_left()
         );
 
     } else {
@@ -1030,13 +1151,11 @@ static void redraw(void) {
             sizeof(text),
             "WAITING FOR PLAYER %d | %02ds",
             latest.current + 1,
-            latest.seconds
+            seconds_left()
         );
     }
 
     write_line(2, text);
-
-    /* Only this player's inventory is displayed. */
 
     snprintf(
         text,
@@ -1089,6 +1208,7 @@ static void redraw(void) {
     /* Battlefield */
 
     draw_board();
+    draw_side_clock();
 
     /* Footer */
 
@@ -1110,10 +1230,30 @@ static void redraw(void) {
         layout.height) {
         write_line(
             layout.footer_y + 1,
-            "1-4 Tools | T/W/L/A/J Move | 5 Undo | 0 Cancel | E End | Q Quit"
+            "Arrows/wheel: Scroll | E: End Turn | Q: Quit"
         );
     }
 
+    fputs("\033[?2026l", stdout);
+    fflush(stdout);
+}
+
+static void update_timer_line(void) {
+    if (!have_state || latest.kind == PKT_FRAME || latest.phase == 2)
+        return;
+    char line[150];
+    if (can_play())
+        snprintf(line, sizeof line,
+                 "YOUR TURN | %02ds | Enter: END TURN | Q: QUIT",
+                 seconds_left());
+    else
+        snprintf(line, sizeof line,
+                 "WAITING FOR PLAYER %d | %02ds",
+                 latest.current + 1, seconds_left());
+    fputs("\033[?2026h", stdout);
+    write_line(2, line);
+    draw_side_clock();
+    fputs("\033[?2026l", stdout);
     fflush(stdout);
 }
 
@@ -1152,8 +1292,6 @@ static void board_click(
 
         return;
     }
-
-    /* Must select a tool first */
 
     if (selected_tool == TOOL_NONE) {
         snprintf(
@@ -1324,82 +1462,34 @@ static int parser_length = 0;
 static char parser_buffer[64];
 
 static void handle_key(char key) {
-    /* Quit game */
     if (key == 'q' || key == 'Q') {
-        send_action(ACT_QUIT, TOOL_NONE, STEP, -1, -1);
+        send_action(
+            ACT_QUIT,
+            TOOL_NONE,
+            STEP,
+            -1,
+            -1
+        );
+
         running = 0;
-        return;
-    }
 
-    /* End turn */
-    if ((key == 'e' || key == 'E' ||
-         key == '\r' || key == '\n') &&
-        can_play() && latest.phase == 1) {
-
+    } else if (
+        (key == 'e' ||
+         key == 'E' ||
+         key == '\r' ||
+         key == '\n') &&
+        can_play() &&
+        latest.phase == 1
+    ) {
         selected_tool = TOOL_NONE;
-        send_action(ACT_END, TOOL_NONE, STEP, -1, -1);
-        return;
-    }
 
-    if (!can_play() || latest.phase == 2) {
-        return;
-    }
-
-    /* Undo previous action */
-    if (key == '5') {
-        send_action(ACT_UNDO, TOOL_NONE, STEP, -1, -1);
-        return;
-    }
-
-    /* Cancel selected tool */
-    if (key == '0') {
-        selected_tool = TOOL_NONE;
-        local_message[0] = '\0';
-        return;
-    }
-
-    /* Tool selection: 1 to 4 */
-    if (key >= '1' && key <= '4') {
-        if (latest.phase != 1) {
-            snprintf(local_message, sizeof(local_message),
-                     "Place your king first.");
-            return;
-        }
-
-        selected_tool = (Tool)(key - '0');
-        local_message[0] = '\0';
-        return;
-    }
-
-    /* King movement shortcuts */
-    if (latest.phase == 1) {
-        switch (key) {
-            case 't': case 'T':
-                selected_move = STEP;
-                break;
-
-            case 'w': case 'W':
-                selected_move = SKEW;
-                break;
-
-            case 'l': case 'L':
-                selected_move = LEAP;
-                break;
-
-            case 'a': case 'A':
-                selected_move = AXIS;
-                break;
-
-            case 'j': case 'J':
-                selected_move = JASMIN;
-                break;
-
-            default:
-                return;
-        }
-
-        selected_tool = TOOL_KING;
-        local_message[0] = '\0';
+        send_action(
+            ACT_END,
+            TOOL_NONE,
+            STEP,
+            -1,
+            -1
+        );
     }
 }
 
@@ -1457,8 +1547,6 @@ static void handle_byte(char key) {
         return;
     }
 
-    /* Mouse coordinates */
-
     if (parser_state == 3) {
         if ((key >= '0' && key <= '9') ||
             key == ';') {
@@ -1477,7 +1565,6 @@ static void handle_byte(char key) {
 
         parser_state = 0;
 
-        /* M = press, m = release */
 
         if (key != 'M') {
             return;
@@ -1511,136 +1598,41 @@ static void handle_byte(char key) {
 
 /* ==================== MAIN CLIENT FUNCTION ==================== */
 
-
-/* ==================== TERMINAL STARTUP MENU ==================== */
-
-static int read_menu_input(const char *prompt, char *buffer, size_t size) {
-    printf("%s", prompt);
-    fflush(stdout);
-
-    if (fgets(buffer, size, stdin) == NULL) {
-        return 0;
-    }
-
-    buffer[strcspn(buffer, "\r\n")] = '\0';
-    return 1;
-}
-
-static int valid_port(const char *port_text) {
-    char *end;
-    errno = 0;
-
-    long port = strtol(port_text, &end, 10);
-
-    while (*end == ' ' || *end == '\t') {
-        end++;
-    }
-
-    return errno == 0 &&
-           *port_text != '\0' &&
-           *end == '\0' &&
-           port >= 1024 &&
-           port <= 65535;
-}
-
-static int show_main_menu(void) {
-    char choice[32];
-
-    while (1) {
-        printf("\n");
-        printf("====================================\n");
-        printf("          KINGS AND CANNONS         \n");
-        printf("====================================\n");
-        printf("          1. Start Game             \n");
-        printf("          2. Instructions           \n");
-        printf("          3. Exit                   \n");
-        printf("====================================\n");
-
-        if (!read_menu_input("Choose an option: ", choice, sizeof(choice))) {
-            return 0;
-        }
-
-        if (strcmp(choice, "1") == 0) {
-            return 1;
-        }
-
-        if (strcmp(choice, "2") == 0) {
-            printf("\n========== INSTRUCTIONS ==========\n");
-            printf("1. Connect to a running game server.\n");
-            printf("2. Follow the battlefield controls displayed in-game.\n");
-            printf("3. Press E to end your turn when allowed.\n");
-            printf("4. Press Q to quit the game.\n");
-            printf("==================================\n");
-
-            char pause[8];
-            if (!read_menu_input("\nPress Enter to return to menu...", pause, sizeof(pause))) {
-                return 0;
-            }
-        } else if (strcmp(choice, "3") == 0) {
-            printf("\nThank you for playing Kings and Cannons!\n");
-            return 0;
-        } else {
-            printf("\nInvalid choice. Please select 1, 2, or 3.\n");
-        }
-    }
-}
-
-/* ==================== MAIN CLIENT FUNCTION ==================== */
-
 int main(int argc, char **argv) {
-    char host[256] = "127.0.0.1";
-    char port[16] = "5555";
+    if (argc != 3) {
+        fprintf(
+            stderr,
+            "Usage: %s SERVER_IP PORT\n",
+            argv[0]
+        );
 
-    if (argc == 1) {
-        if (!show_main_menu()) {
-            return 0;
-        }
-
-        if (!read_menu_input(
-                "\nEnter server IP (default 127.0.0.1): ",
-                host,
-                sizeof(host))) {
-            return 0;
-        }
-
-        if (host[0] == '\0') {
-            strcpy(host, "127.0.0.1");
-        }
-
-        if (!read_menu_input(
-                "Enter server port (default 5555): ",
-                port,
-                sizeof(port))) {
-            return 0;
-        }
-
-        if (port[0] == '\0') {
-            strcpy(port, "5555");
-        }
-    } else if (argc == 3) {
-        snprintf(host, sizeof(host), "%s", argv[1]);
-        snprintf(port, sizeof(port), "%s", argv[2]);
-    } else {
-        fprintf(stderr, "Usage: %s [SERVER_IP PORT]\n", argv[0]);
         return 1;
     }
 
-    if (!valid_port(port)) {
-        fprintf(stderr, "Invalid port. Use a number from 1024 to 65535.\n");
-        return 1;
-    }
+    if (!show_main_menu()) return 0;
 
     signal(SIGPIPE, SIG_IGN);
 
     /* Connect to the authoritative server. */
 
-    printf("\nConnecting to %s:%s...\n", host, port);
+    server_socket = connect_to_server(
+        argv[1],
+        argv[2]
+    );
 
-    server_socket = connect_to_server(host, port);
+    if (server_socket >= 0) {
+        int flag = 1;
+        setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof flag);
+    }
 
     if (server_socket < 0) {
-        fprintf(stderr, "Could not connect to %s:%s\n", host, port);
-        fprintf(stderr, "Check that the server is running and the IP and port are correct.\n");
+        fprintf(
+            stderr,
+            "Could not connect to %s:%s\n",
+            argv[1],
+            argv[2]
+        );
+
         return 1;
     }
 
@@ -1699,6 +1691,8 @@ int main(int argc, char **argv) {
             break;
         }
 
+        int screen_changed = 0;
+
         /* Receive server-authoritative state. */
 
         if (ready > 0 &&
@@ -1706,10 +1700,11 @@ int main(int argc, char **argv) {
                 server_socket,
                 &read_fds
             )) {
+            Packet incoming;
             if (!receive_all(
                     server_socket,
-                    &latest,
-                    sizeof(latest)
+                    &incoming,
+                    sizeof(incoming)
                 )) {
                 snprintf(
                     local_message,
@@ -1720,12 +1715,24 @@ int main(int argc, char **argv) {
                 break;
             }
 
-            if (latest.kind != PKT_STATE &&
-                latest.kind != PKT_FRAME) {
-                continue;
-            }
+            if (incoming.kind != PKT_STATE &&
+                incoming.kind != PKT_FRAME) continue;
 
+            int timer_only = 0;
+            if (have_state && incoming.kind == PKT_STATE &&
+                latest.kind == PKT_STATE) {
+                Packet a = latest, b = incoming;
+                b.seconds = a.seconds;
+                timer_only = memcmp(&a, &b, sizeof a) == 0;
+            }
+            screen_changed = !have_state ||
+                (!timer_only && memcmp(&latest, &incoming, sizeof latest) != 0);
+            latest = incoming;
             have_state = 1;
+            if (incoming.kind == PKT_STATE) {
+                clock_gettime(CLOCK_MONOTONIC, &received_at);
+            }
+            if (timer_only) update_timer_line();
 
             local_message[0] = '\0';
 
@@ -1752,9 +1759,45 @@ int main(int argc, char **argv) {
             for (ssize_t i = 0; i < count; i++) {
                 handle_byte(buffer[i]);
             }
+            if (count > 0) screen_changed = 1;
         }
 
-        redraw();
+        if (ready == 0) {
+            int width, height;
+            get_terminal_size(&width, &height);
+            if (width != layout.width || height != layout.height)
+                screen_changed = 1;
+        }
+        if (screen_changed) redraw();
+
+        if (have_state && latest.phase == 2) {
+            redraw();
+            while (1) {
+                fd_set keys;
+                FD_ZERO(&keys);
+                FD_SET(STDIN_FILENO, &keys);
+                struct timeval wait = { .tv_sec = 0, .tv_usec = 100000 };
+                int ready_key = select(STDIN_FILENO + 1, &keys,
+                                       NULL, NULL, &wait);
+                if (ready_key > 0 && FD_ISSET(STDIN_FILENO, &keys)) {
+                    char key;
+                    if (read(STDIN_FILENO, &key, 1) == 1 &&
+                        (key == '\r' || key == '\n' ||
+                         key == 'q' || key == 'Q')) {
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        if (have_state && latest.kind == PKT_STATE && latest.phase != 2) {
+            int left = seconds_left();
+            if (left != previous_timer) {
+                previous_timer = left;
+                update_timer_line();
+            }
+        }
     }
 
     /* Cleanup */
@@ -1774,4 +1817,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-
