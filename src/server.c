@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,12 +142,6 @@ static int round_number = 1;
 
 static int winner = -1;
 
-/*
- * phase:
- * 0 = King placement
- * 1 = Normal gameplay
- * 2 = Game finished
- */
 static int phase = 0;
 
 static Tool selected_tool = TOOL_NONE;
@@ -159,6 +154,7 @@ static double deadline = 0;
 
 static char message[180] = "";
 static char notice[180] = "Waiting for players.";
+static int visual_stage = 0; 
 
 /* HELPERS */
 
@@ -323,7 +319,7 @@ static int move_legal(
         return 0;
     }
 
-    /* Knight-style LEAP can jump over pieces. */
+    /* Knight-style (LEAP MOVEMENT) */
     if (type != LEAP) {
         int row_step = direction(dest_row - from.row);
         int col_step = direction(dest_col - from.col);
@@ -358,7 +354,7 @@ static int move_legal(
     return 1;
 }
 
-/* WINNER */
+/* DECLERATION */
 
 static void update_victory(void) {
     if (game.lives[0] <= 0 && game.lives[1] <= 0) {
@@ -738,43 +734,45 @@ static void send_view(
         packet.state.moves_remaining[opponent][i] = -1;
     }
 
-    (void)bullets;
-    (void)bullet_count;
-    (void)impacts;
-    (void)impact_count;
-
+    /* Attach visible animation frames to the existing packet format. */
     packet.bullet_count = 0;
     packet.impact_count = 0;
+    packet.action = visual_stage;
+    packet.tool = TOOL_NONE;
 
-    if (phase == 2) {
-        snprintf(
-            packet.note,
-            sizeof(packet.note),
-            "Game finished."
-        );
+    if (kind == PKT_FRAME) {
+        int nuke = strstr(notice, "NUKE EXPLOSION") != NULL;
+        packet.tool = nuke ? TOOL_NUKE : TOOL_CANNON;
 
-    } else if (kind == PKT_FRAME) {
-        snprintf(
-            packet.note,
-            sizeof(packet.note),
-            "Resolving simultaneous attacks..."
-        );
+        if (nuke) {
+            /* Blast locations become public only during the explosion. */
+            for (int i = 0; i < impact_count && i < 18; i++) {
+                int square = impacts[i];
+                if (square >= 0 && square < 100)
+                    packet.impacts[packet.impact_count++] = square;
+            }
+        } else {
+  
+            for (int i = 0; i < bullet_count && i < 4; i++) {
+                int square = bullets[i] % 100;
+                if (square >= 0 && square < 100)
+                    packet.bullets[packet.bullet_count++] = square;
+            }
 
+            for (int i = 0; i < impact_count && i < 18; i++) {
+                int square = impacts[i] % 100;
+                if (square >= 0 && square < 100)
+                    packet.impacts[packet.impact_count++] = square;
+            }
+        }
+        snprintf(packet.note, sizeof packet.note, "%s", notice);
+    } else if (phase == 2) {
+        snprintf(packet.note, sizeof packet.note, "Game finished.");
     } else if (player != current) {
-        snprintf(
-            packet.note,
-            sizeof(packet.note),
-            "Waiting for Player %d.",
-            current + 1
-        );
-
+        snprintf(packet.note, sizeof packet.note,
+                 "Waiting for Player %d.", current + 1);
     } else {
-        snprintf(
-            packet.note,
-            sizeof(packet.note),
-            "%s",
-            notice
-        );
+        snprintf(packet.note, sizeof packet.note, "%s", notice);
     }
 
     if (clients[player] >= 0 &&
@@ -821,7 +819,7 @@ static void visual_frame(
         );
     }
 
-    pause_ms(210);
+    pause_ms(180);
 }
 
 /* TURN MANAGEMENT */
@@ -837,7 +835,7 @@ static void begin_turn(void) {
         current + 1,
         phase == 0
             ? "Place your king."
-            : "Your turn. Press E to finish."
+            : "Your turn. Press Enter to finish."
     );
 
     publish();
@@ -932,7 +930,9 @@ static void resolve_volley(void) {
             "NUKE EXPLOSION!"
         );
 
-        visual_frame(NULL, 0, blast, blast_count);
+        for (visual_stage = 1; visual_stage <= 3; visual_stage++)
+            visual_frame(NULL, 0, blast, blast_count);
+        visual_stage = 0;
 
         for (int i = 0; i < blast_count; i++) {
             int row = blast[i] / BOARD_SIZE;
@@ -994,10 +994,6 @@ static void resolve_volley(void) {
 
             Cell target = game.board[row][col];
 
-            /*
-             * Projectiles pass through: empty squares, other cannons, own king, friendly shields
-             */
-
             if (target.piece == EMPTY ||
                 target.piece == CANNON ||
                 (target.piece == KING &&
@@ -1006,7 +1002,7 @@ static void resolve_volley(void) {
                  target.owner == shot->owner)) {
 
                 bullets[bullet_count++] =
-                    row * BOARD_SIZE + col;
+                    row * BOARD_SIZE + col + shot->owner * 100;
 
                 continue;
             }
@@ -1016,7 +1012,7 @@ static void resolve_volley(void) {
             shot->active = 0;
 
             impacts[impact_count++] =
-                row * BOARD_SIZE + col;
+                row * BOARD_SIZE + col + target.owner * 100 + shot->owner * 200;
 
             if (target.piece == SHIELD) {
                 broken[row][col] = 1;
@@ -1041,12 +1037,14 @@ static void resolve_volley(void) {
             "Simultaneous cannon fire..."
         );
 
+        visual_stage = 1 + (step % 3);
         visual_frame(
             bullets,
             bullet_count,
             impacts,
             impact_count
         );
+        visual_stage = 0;
 
         /* Resolve destroyed shields after each step. */
 
@@ -1390,6 +1388,9 @@ int main(int argc, char **argv) {
             close(listener);
             return 1;
         }
+        int no_delay = 1;
+        setsockopt(clients[player], IPPROTO_TCP, TCP_NODELAY,
+                   &no_delay, sizeof no_delay);
 
         printf("Player %d connected!\n", player + 1);
         fflush(stdout);
