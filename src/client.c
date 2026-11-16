@@ -1110,7 +1110,7 @@ static void redraw(void) {
         layout.height) {
         write_line(
             layout.footer_y + 1,
-            "Arrows/wheel: Scroll | E: End Turn | Q: Quit"
+            "1-4 Tools | T/W/L/A/J Move | 5 Undo | 0 Cancel | E End | Q Quit"
         );
     }
 
@@ -1324,34 +1324,82 @@ static int parser_length = 0;
 static char parser_buffer[64];
 
 static void handle_key(char key) {
+    /* Quit game */
     if (key == 'q' || key == 'Q') {
-        send_action(
-            ACT_QUIT,
-            TOOL_NONE,
-            STEP,
-            -1,
-            -1
-        );
-
+        send_action(ACT_QUIT, TOOL_NONE, STEP, -1, -1);
         running = 0;
+        return;
+    }
 
-    } else if (
-        (key == 'e' ||
-         key == 'E' ||
-         key == '\r' ||
-         key == '\n') &&
-        can_play() &&
-        latest.phase == 1
-    ) {
+    /* End turn */
+    if ((key == 'e' || key == 'E' ||
+         key == '\r' || key == '\n') &&
+        can_play() && latest.phase == 1) {
+
         selected_tool = TOOL_NONE;
+        send_action(ACT_END, TOOL_NONE, STEP, -1, -1);
+        return;
+    }
 
-        send_action(
-            ACT_END,
-            TOOL_NONE,
-            STEP,
-            -1,
-            -1
-        );
+    if (!can_play() || latest.phase == 2) {
+        return;
+    }
+
+    /* Undo previous action */
+    if (key == '5') {
+        send_action(ACT_UNDO, TOOL_NONE, STEP, -1, -1);
+        return;
+    }
+
+    /* Cancel selected tool */
+    if (key == '0') {
+        selected_tool = TOOL_NONE;
+        local_message[0] = '\0';
+        return;
+    }
+
+    /* Tool selection: 1 to 4 */
+    if (key >= '1' && key <= '4') {
+        if (latest.phase != 1) {
+            snprintf(local_message, sizeof(local_message),
+                     "Place your king first.");
+            return;
+        }
+
+        selected_tool = (Tool)(key - '0');
+        local_message[0] = '\0';
+        return;
+    }
+
+    /* King movement shortcuts */
+    if (latest.phase == 1) {
+        switch (key) {
+            case 't': case 'T':
+                selected_move = STEP;
+                break;
+
+            case 'w': case 'W':
+                selected_move = SKEW;
+                break;
+
+            case 'l': case 'L':
+                selected_move = LEAP;
+                break;
+
+            case 'a': case 'A':
+                selected_move = AXIS;
+                break;
+
+            case 'j': case 'J':
+                selected_move = JASMIN;
+                break;
+
+            default:
+                return;
+        }
+
+        selected_tool = TOOL_KING;
+        local_message[0] = '\0';
     }
 }
 
