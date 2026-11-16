@@ -1463,14 +1463,122 @@ static void handle_byte(char key) {
 
 /* ==================== MAIN CLIENT FUNCTION ==================== */
 
-int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(
-            stderr,
-            "Usage: %s SERVER_IP PORT\n",
-            argv[0]
-        );
 
+/* ==================== TERMINAL STARTUP MENU ==================== */
+
+static int read_menu_input(const char *prompt, char *buffer, size_t size) {
+    printf("%s", prompt);
+    fflush(stdout);
+
+    if (fgets(buffer, size, stdin) == NULL) {
+        return 0;
+    }
+
+    buffer[strcspn(buffer, "\r\n")] = '\0';
+    return 1;
+}
+
+static int valid_port(const char *port_text) {
+    char *end;
+    errno = 0;
+
+    long port = strtol(port_text, &end, 10);
+
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+
+    return errno == 0 &&
+           *port_text != '\0' &&
+           *end == '\0' &&
+           port >= 1024 &&
+           port <= 65535;
+}
+
+static int show_main_menu(void) {
+    char choice[32];
+
+    while (1) {
+        printf("\n");
+        printf("====================================\n");
+        printf("          KINGS AND CANNONS         \n");
+        printf("====================================\n");
+        printf("          1. Start Game             \n");
+        printf("          2. Instructions           \n");
+        printf("          3. Exit                   \n");
+        printf("====================================\n");
+
+        if (!read_menu_input("Choose an option: ", choice, sizeof(choice))) {
+            return 0;
+        }
+
+        if (strcmp(choice, "1") == 0) {
+            return 1;
+        }
+
+        if (strcmp(choice, "2") == 0) {
+            printf("\n========== INSTRUCTIONS ==========\n");
+            printf("1. Connect to a running game server.\n");
+            printf("2. Follow the battlefield controls displayed in-game.\n");
+            printf("3. Press E to end your turn when allowed.\n");
+            printf("4. Press Q to quit the game.\n");
+            printf("==================================\n");
+
+            char pause[8];
+            if (!read_menu_input("\nPress Enter to return to menu...", pause, sizeof(pause))) {
+                return 0;
+            }
+        } else if (strcmp(choice, "3") == 0) {
+            printf("\nThank you for playing Kings and Cannons!\n");
+            return 0;
+        } else {
+            printf("\nInvalid choice. Please select 1, 2, or 3.\n");
+        }
+    }
+}
+
+/* ==================== MAIN CLIENT FUNCTION ==================== */
+
+int main(int argc, char **argv) {
+    char host[256] = "127.0.0.1";
+    char port[16] = "5555";
+
+    if (argc == 1) {
+        if (!show_main_menu()) {
+            return 0;
+        }
+
+        if (!read_menu_input(
+                "\nEnter server IP (default 127.0.0.1): ",
+                host,
+                sizeof(host))) {
+            return 0;
+        }
+
+        if (host[0] == '\0') {
+            strcpy(host, "127.0.0.1");
+        }
+
+        if (!read_menu_input(
+                "Enter server port (default 5555): ",
+                port,
+                sizeof(port))) {
+            return 0;
+        }
+
+        if (port[0] == '\0') {
+            strcpy(port, "5555");
+        }
+    } else if (argc == 3) {
+        snprintf(host, sizeof(host), "%s", argv[1]);
+        snprintf(port, sizeof(port), "%s", argv[2]);
+    } else {
+        fprintf(stderr, "Usage: %s [SERVER_IP PORT]\n", argv[0]);
+        return 1;
+    }
+
+    if (!valid_port(port)) {
+        fprintf(stderr, "Invalid port. Use a number from 1024 to 65535.\n");
         return 1;
     }
 
@@ -1478,19 +1586,13 @@ int main(int argc, char **argv) {
 
     /* Connect to the authoritative server. */
 
-    server_socket = connect_to_server(
-        argv[1],
-        argv[2]
-    );
+    printf("\nConnecting to %s:%s...\n", host, port);
+
+    server_socket = connect_to_server(host, port);
 
     if (server_socket < 0) {
-        fprintf(
-            stderr,
-            "Could not connect to %s:%s\n",
-            argv[1],
-            argv[2]
-        );
-
+        fprintf(stderr, "Could not connect to %s:%s\n", host, port);
+        fprintf(stderr, "Check that the server is running and the IP and port are correct.\n");
         return 1;
     }
 
