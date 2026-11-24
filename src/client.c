@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <time.h>
+#include <locale.h>
 #include <netinet/tcp.h>
 #include "terminal_ui.h"
 
@@ -125,8 +126,8 @@ typedef struct {
 
 #define RESET "\033[0m"
 
-#define RED_BG "\033[48;5;224m\033[30m"
-#define GREEN_BG "\033[48;5;194m\033[30m"
+#define GRAY_BG "\033[48;5;250m\033[30m"
+#define WHITE_BG "\033[48;5;231m\033[30m"
 #define YELLOW_BG "\033[48;5;228m\033[30m"
 #define BLACK_BG "\033[48;5;234m\033[97m"
 #define BULLET_BG "\033[48;5;208m\033[30m"
@@ -177,6 +178,7 @@ static int running = 1;
 static int have_state = 0;
 
 static Packet latest;
+/* The client advances the countdown locally between server updates. */
 static struct timespec received_at;
 static int previous_timer = -1;
 
@@ -683,7 +685,7 @@ static int has_impact(int square) {
     return 0;
 }
 
-/* Show movement of the king */
+/* Draw movement hints on the client's own visible battlefield. */
 static int legal_destination(int row, int col) {
     if (!have_state || latest.kind == PKT_FRAME ||
         latest.phase != 1 || latest.current != latest.player ||
@@ -693,6 +695,8 @@ static int legal_destination(int row, int col) {
     if (k.row < 0 || k.col < 0 || latest.state.king_moved[p] ||
         (p == 0 ? row >= 5 : row < 5) ||
         latest.state.board[row][col].piece != EMPTY) return 0;
+    if (latest.state.breach[row][col] &&
+        !latest.state.crater[row][col]) return 0;
     int dr = row - k.row, dc = col - k.col;
     int a = dr < 0 ? -dr : dr;
     int b = dc < 0 ? -dc : dc;
@@ -739,18 +743,22 @@ static const char *square_color(
         return BULLET_BG;
     }
 
+    if (latest.state.crater[row][col]) {
+        return legal_destination(row, col)
+            ? "\033[48;5;214m\033[30m"
+            : "\033[48;5;130m\033[97m";
+    }
+
+    if (latest.state.breach[row][col]) return BLACK_BG;
     if (legal_destination(row, col)) return LEGAL_BG;
 
-    if (latest.state.crater[row][col] ||
-        latest.state.breach[row][col]) {
-        return BLACK_BG;
-    }
+    /* Only highlight your own territory when it is your turn. */
+    int owner = row < 5 ? 0 : 1;
+    if (latest.kind != PKT_FRAME && latest.phase != 2 &&
+        latest.current == latest.player && owner == latest.player)
+        return WHITE_BG;
 
-    if (row < 5) {
-        return RED_BG;
-    }
-
-    return GREEN_BG;
+    return GRAY_BG;
 }
 
 /* ==================== PIECE LABELS ==================== */
@@ -774,15 +782,15 @@ static const char *square_label(
     Cell cell = latest.state.board[row][col];
 
     if (cell.piece == KING) {
-        return cell.owner == 0 ? "K1" : "K2";
+        return MB_CUR_MAX > 1 ? "👑" : "K";
     }
 
     if (cell.piece == SHIELD) {
-        return "[S]";
+        return MB_CUR_MAX > 1 ? "🛡️" : "[S]";
     }
 
     if (cell.piece == CANNON) {
-        return cell.owner == 0 ? "C1" : "C2";
+        return MB_CUR_MAX > 1 ? "💣" : "C";
     }
 
     if (latest.state.crater[row][col]) {
@@ -794,6 +802,13 @@ static const char *square_label(
     }
 
     return "";
+}
+
+/* Emoji labels occupy two terminal columns, not their UTF-8 byte count. */
+static int label_columns(const char *label) {
+    if (!strcmp(label, "👑") || !strcmp(label, "🛡️") ||
+        !strcmp(label, "💣")) return 2;
+    return (int)strlen(label);
 }
 
 /* ==================== BOARD BORDERS ==================== */
@@ -915,49 +930,28 @@ static void draw_board(void) {
                     );
 
                 int label_length =
-                    (int)strlen(label);
+                    label_columns(label);
 
-                if (label_length >
-                    layout.cell_width) {
-                    label_length =
-                        layout.cell_width;
+                if (label_length > layout.cell_width) {
+                    label = "";
+                    label_length = 0;
                 }
 
-                int left_padding =
-                    (layout.cell_width -
-                     label_length) / 2;
 
-                int right_padding =
-                    layout.cell_width -
-                    left_padding -
-                    label_length;
-
+                int cell_x = layout.grid_x + 1 +
+                             c * (layout.cell_width + 1);
+                cursor_at(line, cell_x);
                 fputs(background, stdout);
-
-                for (
-                    int k = 0;
-                    k < left_padding;
-                    k++
-                ) {
+                for (int k = 0; k < layout.cell_width; k++) {
                     putchar(' ');
                 }
-
-                fwrite(
-                    label,
-                    1,
-                    (size_t)label_length,
-                    stdout
-                );
-
-                for (
-                    int k = 0;
-                    k < right_padding;
-                    k++
-                ) {
-                    putchar(' ');
+                if (label_length > 0) {
+                    int padding = (layout.cell_width - label_length) / 2;
+                    cursor_at(line, cell_x + padding);
+                    fputs(label, stdout);
                 }
-
                 fputs(RESET, stdout);
+                cursor_at(line, cell_x + layout.cell_width);
                 putchar('|');
             }
         }
@@ -997,7 +991,6 @@ static void draw_button(
     fputs(RESET, stdout);
 }
 
-/* clock */
 static void draw_side_clock(void) {
     int x = layout.grid_x +
         layout.cols_visible * (layout.cell_width + 1) + 3;
@@ -1027,8 +1020,22 @@ static int can_play(void) {
            latest.current == latest.player;
 }
 
-/* ==================== VICTORY / DEFEAT ==================== */
+/* A high-contrast banner without changing the board dimensions. */
+static void draw_turn_status(const char *text) {
+    cursor_at(2, 1);
+    fputs("\033[2K", stdout);
+    if (latest.kind == PKT_FRAME)
+        fputs("\033[1;33m", stdout);
+    else if (can_play())
+        fputs("\033[1;30;107m", stdout);
+    else
+        fputs("\033[1m", stdout);
+    printf("%-*.*s", layout.width > 1 ? layout.width - 1 : 1,
+           layout.width > 1 ? layout.width - 1 : 1, text);
+    fputs(RESET, stdout);
+}
 
+/* ==================== RESULT SCREEN ==================== */
 
 static void draw_end_screen(void) {
     const char *word = latest.winner == latest.player
@@ -1061,7 +1068,7 @@ static void draw_end_screen(void) {
     fflush(stdout);
 }
 
-/* ==================== UI ==================== */
+/* ==================== COMPLETE UI ==================== */
 
 static void redraw(void) {
     calculate_layout();
@@ -1095,18 +1102,14 @@ static void redraw(void) {
 
     int player = latest.player;
 
-    const char *color =
-        player == 0 ? "RED" : "GREEN";
-
     /* Header */
 
     snprintf(
         text,
         sizeof(text),
-        "KINGS AND CANNONS | ROUND %d | PLAYER %d (%s)",
+        "KINGS AND CANNONS | ROUND %d | PLAYER %d",
         latest.round,
-        player + 1,
-        color
+        player + 1
     );
 
     write_line(1, text);
@@ -1141,7 +1144,7 @@ static void redraw(void) {
         snprintf(
             text,
             sizeof(text),
-            "YOUR TURN | %02ds | E/Enter: END TURN | Q: QUIT",
+            ">>> YOUR TURN <<< | %02ds | ENTER: END TURN",
             seconds_left()
         );
 
@@ -1149,13 +1152,13 @@ static void redraw(void) {
         snprintf(
             text,
             sizeof(text),
-            "WAITING FOR PLAYER %d | %02ds",
+            "WAITING - PLAYER %d IS PLAYING | %02ds",
             latest.current + 1,
             seconds_left()
         );
     }
 
-    write_line(2, text);
+    draw_turn_status(text);
 
     snprintf(
         text,
@@ -1230,7 +1233,7 @@ static void redraw(void) {
         layout.height) {
         write_line(
             layout.footer_y + 1,
-            "Arrows/wheel: Scroll | E: End Turn | Q: Quit"
+            "Arrows/wheel: Scroll | ENTER: End Turn | Q: Quit"
         );
     }
 
@@ -1244,14 +1247,14 @@ static void update_timer_line(void) {
     char line[150];
     if (can_play())
         snprintf(line, sizeof line,
-                 "YOUR TURN | %02ds | Enter: END TURN | Q: QUIT",
+                 ">>> YOUR TURN <<< | %02ds | ENTER: END TURN",
                  seconds_left());
     else
         snprintf(line, sizeof line,
-                 "WAITING FOR PLAYER %d | %02ds",
+                 "WAITING - PLAYER %d IS PLAYING | %02ds",
                  latest.current + 1, seconds_left());
     fputs("\033[?2026h", stdout);
-    write_line(2, line);
+    draw_turn_status(line);
     draw_side_clock();
     fputs("\033[?2026l", stdout);
     fflush(stdout);
@@ -1599,6 +1602,7 @@ static void handle_byte(char key) {
 /* ==================== MAIN CLIENT FUNCTION ==================== */
 
 int main(int argc, char **argv) {
+    setlocale(LC_CTYPE, "");
     if (argc != 3) {
         fprintf(
             stderr,
@@ -1769,6 +1773,7 @@ int main(int argc, char **argv) {
                 screen_changed = 1;
         }
         if (screen_changed) redraw();
+
 
         if (have_state && latest.phase == 2) {
             redraw();
