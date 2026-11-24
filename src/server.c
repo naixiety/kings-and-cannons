@@ -25,7 +25,7 @@
 #define CANNONS_PER_TURN 2
 #define UNDO_LIMIT 128
 
-/* Print Game events. */
+/* Print only important, accepted game events. */
 static void log_square(int player, const char *action, int row, int col) {
     printf("[PLAYER %d] %s at %c%d\n", player + 1,
            action, 'A' + col, row + 1);
@@ -157,12 +157,7 @@ static int round_number = 1;
 
 static int winner = -1;
 
-/*
- * phase:
- * 0 = King placement
- * 1 = Normal gameplay
- * 2 = Game finished
- */
+
 static int phase = 0;
 
 static Tool selected_tool = TOOL_NONE;
@@ -298,6 +293,12 @@ static int move_legal(
     }
 
     if (game.board[dest_row][dest_col].piece != EMPTY) {
+        return 0;
+    }
+
+    /* Destroyed shields are blocked; nuclear craters cause damage. */
+    if (game.breach[dest_row][dest_col] &&
+        !game.crater[dest_row][dest_col]) {
         return 0;
     }
 
@@ -783,13 +784,18 @@ static void send_view(
                     packet.impacts[packet.impact_count++] = square;
             }
         } else {
-
+            /* Show the SAME firing animations to both clients.
+               The hundreds digit encodes the shooter, while the
+               remainder gives the square (0..99). This removes
+               ownership before sending the projectile location. */
             for (int i = 0; i < bullet_count && i < 4; i++) {
                 int square = bullets[i] % 100;
                 if (square >= 0 && square < 100)
                     packet.bullets[packet.bullet_count++] = square;
             }
 
+            /* Every player sees where a projectile explodes.
+               The destination square is in the last two digits. */
             for (int i = 0; i < impact_count && i < 18; i++) {
                 int square = impacts[i] % 100;
                 if (square >= 0 && square < 100)
@@ -1038,7 +1044,9 @@ static void resolve_volley(void) {
 
             Cell target = game.board[row][col];
 
-            /* * Projectiles CAN PASS  */
+            /*
+             * Projectiles pass through: empty squares, other cannons, own king, friendly shields
+             */
 
             if (target.piece == EMPTY ||
                 target.piece == CANNON ||
