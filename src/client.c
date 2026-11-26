@@ -1038,35 +1038,139 @@ static void draw_turn_status(const char *text) {
 /* ==================== RESULT SCREEN ==================== */
 
 static void draw_end_screen(void) {
-    const char *word = latest.winner == latest.player
-        ? "VICTORY" : "DEFEAT";
 
-    /* Same simple ASCII border for both results. */
-    const char *border = "//===================================//";
-    const int inside_width = (int)strlen(border) - 4;
+    static const char *victory[] = {
+        "oooooo     oooo ooooo   .oooooo.   ooooooooooooo   .oooooo.   ooooooooo.   oooooo   oooo",
+        " `888.     .8'  `888'  d8P'  `Y8b  8'   888   `8  d8P'  `Y8b  `888   `Y88.  `888.   .8'",
+        "  `888.   .8'    888  888               888      888      888  888   .d88'   `888. .8'",
+        "   `888. .8'     888  888               888      888      888  888ooo88P'     `888.8'",
+        "    `888.8'      888  888               888      888      888  888`88b.        `888'",
+        "     `888'       888  `88b    ooo       888      `88b    d88'  888  `88b.       888",
+        "      `8'       o888o  `Y8bood8P'      o888o      `Y8bood8P'  o888o  o888o     o888o"
+    };
+
+    static const char *defeat[] = {
+        "oooooooooo.   oooooooooooo oooooooooooo oooooooooooo       .o.       ooooooooooooo",
+        "`888'   `Y8b  `888'     `8 `888'     `8 `888'     `8      .888.      8'   888   `8",
+        " 888      888  888          888          888             .8\"888.          888",
+        " 888      888  888oooo8     888oooo8     888oooo8       .8' `888.         888",
+        " 888      888  888    \"     888    \"     888    \"      .88ooo8888.        888",
+        " 888     d88'  888       o  888          888       o  .8'     `888.       888",
+        "o888bood8P'   o888ooooood8 o888o        o888ooooood8 o88o     o8888o     o888o"
+    };
+    
+    static const char *draw[] = {
+        "oooooooooo.   ooooooooo.         .o.       oooooo   oooooo     oooo",
+        "`888'   `Y8b  `888   `Y88.      .888.       `888.    `888.     .8'",  
+        " 888      888  888   .d88'     .8\"888.       `888.   .8888.   .8'",   
+        " 888      888  888ooo88P'     .8' `888.       `888  .8'`888. .8'",    
+        " 888      888  888`88b.      .88ooo8888.       `888.8'  `888.8'",     
+        " 888     d88'  888  `88b.   .8'     `888.       `888'    `888'",      
+        "o888bood8P'   o888o  o888o o88o     o8888o       `8'      `8'"                                                                                                        
+    };
+
+    const char **art;
+    const char *color;
+    const char *word;
+
+    int art_height = 7;
+    int art_width = 0;
+
+    /* Determine the game result. */
+
+    if (latest.winner == 2) {
+        art = draw;
+        word = "DRAW";
+        color = "\033[1;93m";
+    } else if (latest.winner == latest.player) {
+        art = victory;
+        word = "VICTORY";
+        color = "\033[1;92m";
+    } else {
+        art = defeat;
+        word = "DEFEAT";
+        color = "\033[1;91m";
+    }
+
+    /* Get terminal dimensions. */
+
     int screen_width, screen_height;
-    get_terminal_size(&screen_width, &screen_height);
 
-    int x = (screen_width - (int)strlen(border)) / 2 + 1;
-    int y = (screen_height - 5) / 2 + 1;
-    if (x < 1) x = 1;
-    if (y < 1) y = 1;
+    get_terminal_size(
+        &screen_width,
+        &screen_height
+    );
+
+    if (art != NULL) {
+        for (int i = 0; i < art_height; i++) {
+            int length = (int)strlen(art[i]);
+
+            if (length > art_width) {
+                art_width = length;
+            }
+        }
+    }
+
+    /* Clear the terminal. */
 
     fputs("\033[2J\033[H", stdout);
-    cursor_at(y, x);
-    printf("%s", border);
-    cursor_at(y + 1, x);
-    printf("||%*s||", inside_width, "");
-    cursor_at(y + 2, x);
-    int left = (inside_width - (int)strlen(word)) / 2;
-    int right = inside_width - left - (int)strlen(word);
-    printf("||%*s%s%*s||", left, "", word, right, "");
-    cursor_at(y + 3, x);
-    printf("||%*s||", inside_width, "");
-    cursor_at(y + 4, x);
-    printf("%s", border);
+
+    /* Draw the large result text. */
+
+    int bottom;
+
+    if (art != NULL &&
+        screen_width > art_width &&
+        screen_height >= art_height + 5) {
+
+        int x = (screen_width - art_width) / 2 + 1;
+        int y = (screen_height - art_height - 3) / 2 + 1;
+
+        fputs(color, stdout);
+
+        for (int i = 0; i < art_height; i++) {
+            cursor_at(y + i, x);
+            printf("%s", art[i]);
+        }
+
+        fputs(RESET, stdout);
+
+        bottom = y + art_height;
+
+    } else {
+
+        /* Fallback for smaller terminals or a draw. */
+
+        int x = (screen_width - (int)strlen(word)) / 2 + 1;
+        int y = screen_height / 2;
+
+        if (x < 1) x = 1;
+        if (y < 1) y = 1;
+
+        cursor_at(y, x);
+        printf("%s%s%s", color, word, RESET);
+
+        bottom = y + 1;
+    }
+
+    /* Exit instruction. */
+
+    const char *message = "Press ENTER or Q to exit.";
+
+    int message_x =
+        (screen_width - (int)strlen(message)) / 2 + 1;
+
+    if (message_x < 1) message_x = 1;
+
+    if (bottom + 2 <= screen_height) {
+        cursor_at(bottom + 2, message_x);
+        printf("\033[90m%.*s%s",
+               screen_width, message, RESET);
+    }
+
     fflush(stdout);
 }
+
 
 /* ==================== COMPLETE UI ==================== */
 
