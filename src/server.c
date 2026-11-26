@@ -579,10 +579,7 @@ static void perform_board_action(
 
     /* Shield and cannon placement */
 
-    if (!own_territory(player, row) ||
-        game.board[row][col].piece != EMPTY ||
-        game.crater[row][col] ||
-        game.breach[row][col]) {
+    if (!own_territory(player,row) || game.board[row][col].piece != EMPTY || (game.breach[row][col] && !game.crater[row][col]) || (game.crater[row][col] && selected_tool != TOOL_CANNON)) {
 
         snprintf(
             message,
@@ -784,18 +781,14 @@ static void send_view(
                     packet.impacts[packet.impact_count++] = square;
             }
         } else {
-            /* Show the SAME firing animations to both clients.
-               The hundreds digit encodes the shooter, while the
-               remainder gives the square (0..99). This removes
-               ownership before sending the projectile location. */
+
             for (int i = 0; i < bullet_count && i < 4; i++) {
                 int square = bullets[i] % 100;
                 if (square >= 0 && square < 100)
                     packet.bullets[packet.bullet_count++] = square;
             }
 
-            /* Every player sees where a projectile explodes.
-               The destination square is in the last two digits. */
+  
             for (int i = 0; i < impact_count && i < 18; i++) {
                 int square = impacts[i] % 100;
                 if (square >= 0 && square < 100)
@@ -998,11 +991,11 @@ static void resolve_volley(void) {
 
     /* Cannons destroyed by a nuke cannot fire. */
 
-    for (int i = 0; i < shot_count; i++) {
-        if (game.crater[shots[i].row][shots[i].col]) {
-            shots[i].active = 0;
-        }
-    }
+    for (int i = 0; i < shot_count; i++){
+    if (game.board[shots[i].row][shots[i].col].piece != CANNON){
+        shots[i].active = 0;
+    }   
+}
 
     /* CANNON FIRE */
 
